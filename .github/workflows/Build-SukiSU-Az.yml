@@ -318,59 +318,40 @@ jobs:
 
           echo "::endgroup::"
 
-      - name: 🩹 Disable -Werror（一刀切：把所有 strict warning 降级）
-        # OnePlus 6.1 base + 新版 clang 触发一系列 -Werror=*：
-        #   - array-bounds (signal.h sig[])
-        #   - unused-but-set-variable
-        #   - stringop-overflow
-        #   - 等等
-        # 一个一个加 -Wno-error= 太累，直接全局把 -Werror 拆了，让 warning 不致命
-        # 副作用：会出很多 warning 噪音，但不影响产物
+      - name: 🩹 Disable -Werror（clang 安全版）
+        # 用的是 clang/LLVM，所以选项要按 clang 来 ——
+        # 关键加一条 -Wno-unknown-warning-option：让 clang 静默不认识的 -Wno-*
+        # 这样即便后续追加了 GCC-only 的选项（如 stringop-overflow），clang 也不会 fail
         run: |
           set -euo pipefail
-          echo "::group::Disable -Werror globally"
+          echo "::group::Disable -Werror (clang-safe)"
           cd kernel_workspace/kernel_platform/common
 
-          # 1) 主 Makefile 追加宽容编译标志
+          # clang 真支持的 -Wno-* + 一个 -Wno-unknown-warning-option 兜底所有未知
+          AZ_RELAX_FLAGS='-Wno-error -Wno-unknown-warning-option -Wno-array-bounds -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-uninitialized -Wno-incompatible-pointer-types -Wno-format -Wno-pointer-bool-conversion -Wno-shift-overflow'
+
           if ! /usr/bin/grep -q "Az-relax-warnings" Makefile; then
             {
               echo ""
-              echo "# Az-relax-warnings: 关掉 strict 警告升错，避免新 clang vs 老内核兼容崩"
-              echo "KBUILD_CFLAGS += -Wno-error"
-              echo "KBUILD_CFLAGS += -Wno-array-bounds"
-              echo "KBUILD_CFLAGS += -Wno-stringop-overflow"
-              echo "KBUILD_CFLAGS += -Wno-stringop-overread"
-              echo "KBUILD_CFLAGS += -Wno-restrict"
-              echo "KBUILD_CFLAGS += -Wno-zero-length-bounds"
-              echo "KBUILD_CFLAGS += -Wno-unused-but-set-variable"
-              echo "KBUILD_CFLAGS += -Wno-format-truncation"
-              echo "KBUILD_CFLAGS += -Wno-format-overflow"
-              echo "KBUILD_CFLAGS += -Wno-dangling-pointer"
-              echo "KBUILD_CFLAGS += -Wno-maybe-uninitialized"
-              echo "KBUILD_CFLAGS += -Wno-misleading-indentation"
-              echo "KBUILD_CFLAGS += -Wno-uninitialized"
+              echo "# Az-relax-warnings: clang 安全版，含 unknown-warning-option 兜底"
+              echo "KBUILD_CFLAGS += $AZ_RELAX_FLAGS"
             } >> Makefile
-            echo "✅ 已往 common/Makefile 追加 relax flags"
+            echo "✅ 已往 common/Makefile 追加 clang 兼容 relax flags"
           else
             echo "ℹ️ relax flags 已存在"
           fi
 
-          # 2) msm-kernel 也同步（部分模块从这边编）
+          # msm-kernel 同步
           if [ -f ../msm-kernel/Makefile ] && ! /usr/bin/grep -q "Az-relax-warnings" ../msm-kernel/Makefile; then
             {
               echo ""
               echo "# Az-relax-warnings"
-              echo "KBUILD_CFLAGS += -Wno-error -Wno-array-bounds -Wno-stringop-overflow"
-              echo "KBUILD_CFLAGS += -Wno-stringop-overread -Wno-restrict -Wno-zero-length-bounds"
-              echo "KBUILD_CFLAGS += -Wno-unused-but-set-variable -Wno-format-truncation"
-              echo "KBUILD_CFLAGS += -Wno-format-overflow -Wno-dangling-pointer"
-              echo "KBUILD_CFLAGS += -Wno-maybe-uninitialized -Wno-misleading-indentation"
-              echo "KBUILD_CFLAGS += -Wno-uninitialized"
+              echo "KBUILD_CFLAGS += $AZ_RELAX_FLAGS"
             } >> ../msm-kernel/Makefile
             echo "✅ 已往 msm-kernel/Makefile 追加 relax flags"
           fi
 
-          # 3) build.config.gki / build.config.constants 里的 -Werror 也去掉
+          # 从 build.config.* 移除已有 -Werror（如有）
           for cfg in build.config.gki build.config.constants build.config.common; do
             if [ -f "$cfg" ] && /usr/bin/grep -q "Werror" "$cfg"; then
               /usr/bin/sed -i 's/-Werror[^ ]*//g' "$cfg"
