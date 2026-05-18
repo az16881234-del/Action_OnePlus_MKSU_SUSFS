@@ -231,6 +231,98 @@ jobs:
           fi
           echo "::endgroup::"
 
+      - name: 🩹 Add SukiSU-Ultra hook link stubs
+        # ksud.c 与 selinuxfs.c（被 69_hide_stuff.patch 改过）引用了一系列符号：
+        #   ksu_input_hook_key_false / ksu_init_rc_hook_key_false (static_key_false)
+        #   ksu_is_input_hook_enabled / ksu_is_init_rc_hook_enabled (bool fn)
+        #   ksu_selinux_hide_running (bool fn)
+        #   fake_state (int)
+        # 这些符号 SukiSU-Ultra 在某些 hook 实现文件里 DEFINE_STATIC_KEY_FALSE 出来，
+        # 但当前 main 分支 + 这套补丁组合下，那些文件没编进 vmlinux → 链接失败
+        # 修法：注入一个 stub .c 文件提供 weak 兜底定义，hook 表现为"未启用"
+        run: |
+          set -euo pipefail
+          echo "::group::Add KSU hook link stubs"
+
+          # 找 KernelSU 目录（不同结构，多处搜索）
+          KSU_DIR=""
+          for d in \
+            kernel_workspace/kernel_platform/KernelSU \
+            kernel_workspace/kernel_platform/common/drivers/kernelsu \
+            kernel_workspace/kernel_platform/drivers/kernelsu; do
+            if [ -d "$d" ]; then
+              KSU_DIR="$d"
+              break
+            fi
+          done
+
+          if [ -z "$KSU_DIR" ]; then
+            echo "::error::找不到 KernelSU 目录"
+            exit 1
+          fi
+          echo "📁 KSU 根目录: $KSU_DIR"
+
+          # 找该目录下的 Makefile / Kbuild（SukiSU-Ultra 可能用 Kbuild）
+          MAKEFILE=""
+          for f in "$KSU_DIR/Kbuild" "$KSU_DIR/Makefile" "$KSU_DIR/kernel/Kbuild" "$KSU_DIR/kernel/Makefile"; do
+            if [ -f "$f" ]; then
+              MAKEFILE="$f"
+              break
+            fi
+          done
+          if [ -z "$MAKEFILE" ]; then
+            echo "::error::找不到 KSU Makefile/Kbuild"
+            exit 1
+          fi
+          echo "📄 Makefile: $MAKEFILE"
+          STUB_DIR=$(dirname "$MAKEFILE")
+
+          # 创建 stub 源文件
+          STUB_FILE="$STUB_DIR/az_link_stubs.c"
+          cat > "$STUB_FILE" <<'STUB_EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          // AZ stubs: 兜底 SukiSU-Ultra 引用了但没在 vmlinux 里定义的符号
+          // 全部表现为"hook 未启用"，让链接通过；功能上等于禁用对应 hook
+          #include <linux/jump_label.h>
+          #include <linux/types.h>
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/stddef.h>
+
+          // static_key_false 占位
+          DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false);
+          DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);
+
+          // hook 启用检查（始终 false）
+          bool ksu_is_input_hook_enabled(void) { return false; }
+          bool ksu_is_init_rc_hook_enabled(void) { return false; }
+
+          // SELinux 隐藏（始终 false 表示"未隐藏"，对未注入功能无害）
+          bool ksu_selinux_hide_running(void) { return false; }
+
+          // fake_state: 69_hide_stuff.patch 用它做 selinux 状态欺骗
+          // 默认 1 = enforcing，跟真实状态对齐就行
+          int fake_state = 1;
+          STUB_EOF
+          # 去掉 heredoc 每行前导的 10 个空格（YAML 缩进）
+          /usr/bin/sed -i 's/^          //' "$STUB_FILE"
+          echo "✅ 写入 $STUB_FILE"
+          /usr/bin/head -8 "$STUB_FILE"
+          echo "..."
+
+          # 加到 Makefile（如果还没加）
+          if ! /usr/bin/grep -q "az_link_stubs.o" "$MAKEFILE"; then
+            {
+              echo ""
+              echo "# Az link stubs"
+              echo "obj-\$(CONFIG_KSU) += az_link_stubs.o"
+            } >> "$MAKEFILE"
+            echo "✅ az_link_stubs.o 已加入 $MAKEFILE"
+          else
+            echo "ℹ️ Makefile 里已有 az_link_stubs.o，跳过"
+          fi
+          echo "::endgroup::"
+
       - name: Apply Patches SukiSU Ultra
         run: |
           cd kernel_workspace
