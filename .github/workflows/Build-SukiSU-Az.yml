@@ -191,6 +191,46 @@ jobs:
           export KSU_VERSION=$KSU_VERSION
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
 
+      - name: 🩹 Fix SukiSU-Ultra event.c USER_ARG_NULL 类型错配
+        # SukiSU-Ultra main 分支已知 bug:
+        # event.c 里 USER_ARG_NULL 定义成 struct 值 ((struct user_arg_ptr){ 0 })
+        # 但 ksu_sulog_capture 函数签名要求是指针 struct user_arg_ptr *
+        # 类型不匹配 → 编译 hard error（即便 -Werror 关掉也是 type error）
+        # 修法：把宏改成空指针 (struct user_arg_ptr *)NULL
+        run: |
+          set -euo pipefail
+          echo "::group::Fix USER_ARG_NULL 类型"
+          # 找出 event.c 实际路径（不同提交可能在不同位置）
+          EVENT_C=""
+          for f in \
+            kernel_workspace/kernel_platform/KernelSU/kernel/sulog/event.c \
+            kernel_workspace/kernel_platform/common/drivers/kernelsu/sulog/event.c \
+            $(find kernel_workspace/kernel_platform -name "event.c" -path "*sulog*" 2>/dev/null); do
+            if [ -f "$f" ]; then
+              EVENT_C="$f"
+              break
+            fi
+          done
+
+          if [ -z "$EVENT_C" ]; then
+            echo "ℹ️ 找不到 sulog/event.c，可能这版 SukiSU-Ultra 没有这个文件，跳过"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          echo "📄 目标文件: $EVENT_C"
+          if /usr/bin/grep -q "USER_ARG_NULL ((struct user_arg_ptr){ 0 })" "$EVENT_C"; then
+            /usr/bin/sed -i \
+              's|#define USER_ARG_NULL ((struct user_arg_ptr){ 0 })|#define USER_ARG_NULL ((struct user_arg_ptr *)NULL)|' \
+              "$EVENT_C"
+            echo "✅ USER_ARG_NULL 已改为指针 NULL"
+            /usr/bin/grep -n "USER_ARG_NULL" "$EVENT_C" | head -3
+          else
+            echo "ℹ️ USER_ARG_NULL 不是 struct-value 形式，可能已修过，跳过"
+            /usr/bin/grep -n "USER_ARG_NULL" "$EVENT_C" | head -3
+          fi
+          echo "::endgroup::"
+
       - name: Apply Patches SukiSU Ultra
         run: |
           cd kernel_workspace
@@ -328,7 +368,7 @@ jobs:
           cd kernel_workspace/kernel_platform/common
 
           # clang 真支持的 -Wno-* + 一个 -Wno-unknown-warning-option 兜底所有未知
-          AZ_RELAX_FLAGS='-Wno-error -Wno-unknown-warning-option -Wno-array-bounds -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-uninitialized -Wno-incompatible-pointer-types -Wno-format -Wno-pointer-bool-conversion -Wno-shift-overflow'
+          AZ_RELAX_FLAGS='-Wno-error -Wno-unknown-warning-option -Wno-array-bounds -Wno-unused-but-set-variable -Wno-misleading-indentation -Wno-uninitialized -Wno-incompatible-pointer-types -Wno-format -Wno-pointer-bool-conversion -Wno-shift-overflow -Wno-macro-redefined'
 
           if ! /usr/bin/grep -q "Az-relax-warnings" Makefile; then
             {
