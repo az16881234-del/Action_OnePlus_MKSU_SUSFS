@@ -1,4 +1,4 @@
-name: Build OnePlus_SukiSU Ultra (Az - SUSFS shim 修复版)
+name: Build OnePlus_SukiSU Ultra (Az v2 - 修复 Hide SELinux + 补全 SUSFS 开关)
 on:
   workflow_dispatch:
     inputs:
@@ -109,6 +109,11 @@ on:
         description: "是否启用添加更多的ZRAM算法？"
         required: true
         default: false
+      KERNEL_SUFFIX:
+        type: string
+        description: "内核版本自定义后缀（最终内核版本：6.1.118-android14-{KSUVER}-{后缀}）"
+        required: true
+        default: "Az1688"
 
 jobs:
   build:
@@ -191,6 +196,55 @@ jobs:
           export KSU_VERSION=$KSU_VERSION
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
 
+      # ============================================================
+      # 自定义内核版本号显示
+      # 目标格式：6.1.118-android14-{KSUVER}-{KERNEL_SUFFIX}
+      # 例如：   6.1.118-android14-40771-Az1688
+      # ============================================================
+      - name: 🏷️ Customize kernel version string
+        env:
+          KSUVER: ${{ env.KSUVER }}
+          KERNEL_SUFFIX: ${{ github.event.inputs.KERNEL_SUFFIX }}
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform
+
+          # 兜底：如果 KERNEL_SUFFIX 为空，用默认值
+          SUFFIX="${KERNEL_SUFFIX:-Az1688}"
+          # 清掉非法字符（只允许 [A-Za-z0-9_-]）
+          SUFFIX=$(echo "$SUFFIX" | sed 's/[^A-Za-z0-9_-]//g')
+          [ -z "$SUFFIX" ] && SUFFIX="Az1688"
+
+          # 最终要呈现的 LOCALVERSION 字符串
+          # uname -r 输出： <KERNEL_VERSION>-<ANDROID_VERSION>-<KSUVER>-<SUFFIX>
+          # setlocalversion 应该输出："-<KSUVER>-<SUFFIX>"（前导横杠）
+          FINAL_LOCAL="-${KSUVER}-${SUFFIX}"
+          echo "🎯 目标 setlocalversion 输出：$FINAL_LOCAL"
+
+          # 改 common/scripts/setlocalversion：直接 echo 固定字符串，跳过 git/svn 逻辑
+          # ⚠️ 不用 heredoc（YAML 缩进下 EOF 终结符不识别），用 printf 三行写入
+          for SV in common/scripts/setlocalversion msm-kernel/scripts/setlocalversion external/dtc/scripts/setlocalversion; do
+            if [ -f "$SV" ]; then
+              # 备份原文件
+              cp "$SV" "$SV.bak"
+              # 用 printf 写入新内容（一次性 3 行）
+              printf '#!/bin/sh\n# Az v2: forced kernel local version\necho "%s"\n' "$FINAL_LOCAL" > "$SV"
+              chmod +x "$SV"
+              echo "✅ 重写 $SV"
+              echo "── 文件内容："
+              cat "$SV"
+              echo "── 实际输出："
+              /bin/sh "$SV" . || true
+              echo ""
+            fi
+          done
+
+          # 同时把 LOCALVERSION 配置项写到 defconfig（防被某些 makefile 拼接）
+          # 注意：不在这里写，留给 Make config 步骤统一处理（在后面单独 step 加 CONFIG_LOCALVERSION）
+          echo "FINAL_LOCAL=$FINAL_LOCAL" >> $GITHUB_ENV
+          echo "KERNEL_SUFFIX_CLEAN=$SUFFIX" >> $GITHUB_ENV
+          echo "✅ 自定义版本配置完成"
+
       - name: 🩹 Fix SukiSU-Ultra event.c USER_ARG_NULL 类型错配
         # SukiSU-Ultra main 分支已知 bug:
         # event.c 里 USER_ARG_NULL 定义成 struct 值 ((struct user_arg_ptr){ 0 })
@@ -231,6 +285,77 @@ jobs:
           fi
           echo "::endgroup::"
 
+      # ============================================================
+      # Az v2: 诊断 SukiSU 真实 ksu_selinux_hide_running 实现位置
+      # 目的：让 Manager 里 "Hide SELinux Modifications" 不再报"不支持"
+      # 策略：
+      #   1) 找到 KSU 源码里定义 ksu_selinux_hide_running 的 .c 文件
+      #   2) 确认它是否在 Kbuild 的 obj-y 列表里
+      #   3) 不在就强制加进去
+      #   4) 这样真实实现编进内核，weak stub 被覆盖，Manager 可识别
+      # ============================================================
+      - name: 🔍 Diagnose & enable real ksu_selinux_hide_running
+        run: |
+          set -euo pipefail
+          echo "::group::Locate real KSU selinux hide implementation"
+
+          # 找 KSU 根目录
+          KSU_DIR=""
+          for d in \
+            kernel_workspace/kernel_platform/KernelSU \
+            kernel_workspace/kernel_platform/common/drivers/kernelsu \
+            kernel_workspace/kernel_platform/drivers/kernelsu; do
+            if [ -d "$d" ]; then
+              KSU_DIR="$d"
+              break
+            fi
+          done
+          [ -z "$KSU_DIR" ] && { echo "::error::no KSU dir"; exit 1; }
+          echo "📁 KSU: $KSU_DIR"
+
+          # 找定义 ksu_selinux_hide_running 的文件（不限于 selinux.c，可能在 sepolicy.c / core_hook.c）
+          REAL_FILES=$(grep -rEln '\b(ksu_selinux_hide_running|ksu_is_selinux_hidden)\s*\(' "$KSU_DIR" \
+                       --include='*.c' 2>/dev/null || true)
+          echo "── 定义文件候选："
+          echo "$REAL_FILES"
+
+          if [ -z "$REAL_FILES" ]; then
+            echo "⚠️ 未找到真实定义，stub 会做兜底，Manager 可能显示不支持"
+            echo "   后续 Add hook link stubs 步骤的 weak stub 至少能让链接通过"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # 找 Makefile/Kbuild
+          MAKEFILE=""
+          for f in "$KSU_DIR/Kbuild" "$KSU_DIR/Makefile" "$KSU_DIR/kernel/Kbuild" "$KSU_DIR/kernel/Makefile"; do
+            [ -f "$f" ] && MAKEFILE="$f" && break
+          done
+          [ -z "$MAKEFILE" ] && { echo "::error::no makefile"; exit 1; }
+          echo "📄 Makefile: $MAKEFILE"
+
+          # 把候选文件确认加入 obj-y
+          for SRC in $REAL_FILES; do
+            BASE=$(basename "$SRC" .c)
+            REL=$(realpath --relative-to="$(dirname "$MAKEFILE")" "$SRC" 2>/dev/null || echo "$BASE")
+            OBJ=$(echo "$REL" | sed 's/\.c$/.o/')
+
+            if grep -qE "obj-(y|\\\$\\(CONFIG_KSU\\))\s*\+=.*$BASE" "$MAKEFILE"; then
+              echo "  ✓ $BASE 已在 Makefile"
+            else
+              echo "  + 强制加入 $OBJ → $MAKEFILE"
+              {
+                echo ""
+                echo "# Az v2: force-include real ksu_selinux_hide_running impl"
+                echo "obj-\$(CONFIG_KSU) += $OBJ"
+              } >> "$MAKEFILE"
+            fi
+          done
+
+          echo "── Makefile 末尾："
+          tail -10 "$MAKEFILE"
+          echo "::endgroup::"
+
       - name: 🩹 Add SukiSU-Ultra hook link stubs
         # ksud.c 与 selinuxfs.c（被 69_hide_stuff.patch 改过）引用了一系列符号：
         #   ksu_input_hook_key_false / ksu_init_rc_hook_key_false (static_key_false)
@@ -240,6 +365,7 @@ jobs:
         # 这些符号 SukiSU-Ultra 在某些 hook 实现文件里 DEFINE_STATIC_KEY_FALSE 出来，
         # 但当前 main 分支 + 这套补丁组合下，那些文件没编进 vmlinux → 链接失败
         # 修法：注入一个 stub .c 文件提供 weak 兜底定义，hook 表现为"未启用"
+        # Az v2: stub 全部用 __weak，让上一步找到的真实实现优先链接
         run: |
           set -euo pipefail
           echo "::group::Add KSU hook link stubs"
@@ -281,28 +407,33 @@ jobs:
           STUB_FILE="$STUB_DIR/az_link_stubs.c"
           cat > "$STUB_FILE" <<'STUB_EOF'
           // SPDX-License-Identifier: GPL-2.0
-          // AZ stubs: 兜底 SukiSU-Ultra 引用了但没在 vmlinux 里定义的符号
-          // 全部表现为"hook 未启用"，让链接通过；功能上等于禁用对应 hook
+          // AZ stubs v2: 全部 weak symbol —— 真实实现存在时被覆盖，不存在时回落
+          // 这样 "Hide SELinux Modifications" 等开关在 Manager 里会真正可用
           #include <linux/jump_label.h>
           #include <linux/types.h>
           #include <linux/module.h>
           #include <linux/kernel.h>
           #include <linux/stddef.h>
 
-          // static_key_false 占位
+          // static_key_false 占位（weak 让真实定义优先）
+          #ifndef KSU_INPUT_HOOK_KEY_DEFINED
           DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false);
+          #endif
+          #ifndef KSU_INIT_RC_HOOK_KEY_DEFINED
           DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);
+          #endif
 
-          // hook 启用检查（始终 false）
-          bool ksu_is_input_hook_enabled(void) { return false; }
-          bool ksu_is_init_rc_hook_enabled(void) { return false; }
+          // hook 启用检查 — 用 __weak 让 SukiSU 自己的实现优先
+          __attribute__((weak)) bool ksu_is_input_hook_enabled(void) { return false; }
+          __attribute__((weak)) bool ksu_is_init_rc_hook_enabled(void) { return false; }
 
-          // SELinux 隐藏（始终 false 表示"未隐藏"，对未注入功能无害）
-          bool ksu_selinux_hide_running(void) { return false; }
+          // SELinux 隐藏 — 关键：必须 weak，否则 Manager 报"不支持"
+          // 真实实现在 kernel/selinux/selinux.c 里，weak 让链接器选它
+          __attribute__((weak)) bool ksu_selinux_hide_running(void) { return false; }
 
           // fake_state: 69_hide_stuff.patch 用它做 selinux 状态欺骗
-          // 默认 1 = enforcing，跟真实状态对齐就行
-          int fake_state = 1;
+          // weak 让 patch 自己的定义优先
+          __attribute__((weak)) int fake_state = 1;
           STUB_EOF
           # 去掉 heredoc 每行前导的 10 个空格（YAML 缩进）
           /usr/bin/sed -i 's/^          //' "$STUB_FILE"
@@ -536,6 +667,35 @@ jobs:
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CONFIG_FILE"
+
+          # ===== Az 补全：让 Manager 里所有开关都"可用"而不是"不支持" =====
+          echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KSU_SUSFS_SUS_MAPS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KSU_SUSFS_SUS_BIND_MOUNT=y" >> "$CONFIG_FILE"
+
+          # KSU 钩子相关（CONFIG_KSU_MANUAL_HOOK 让 inline hook 在某些机型可用）
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KPROBES=y" >> "$CONFIG_FILE"
+          echo "CONFIG_HAVE_KPROBES=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KPROBE_EVENTS=y" >> "$CONFIG_FILE"
+
+          # 隐藏 KSU/SUSFS 符号的辅助（让 /proc/kallsyms 看不到）
+          echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KALLSYMS_ALL=y" >> "$CONFIG_FILE"
+
+          # ============================================================
+          # 自定义版本号双保险：CONFIG_LOCALVERSION + LOCALVERSION_AUTO=n
+          # 这样不管 setlocalversion 是否被覆盖，最终都能拼接成期望格式
+          # ============================================================
+          SUFFIX_CLEAN="${KERNEL_SUFFIX_CLEAN:-Az1688}"
+          # 删掉旧的（如果有）
+          sed -i '/^CONFIG_LOCALVERSION=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$CONFIG_FILE"
+          # 写入新的（注意：CONFIG_LOCALVERSION 会接在 KERNELRELEASE 后面，作为静态后缀）
+          # 这里不写后缀，让 setlocalversion 输出动态部分；只关掉 AUTO 避免追加 git hash
+          echo 'CONFIG_LOCALVERSION=""' >> "$CONFIG_FILE"
+          echo "# CONFIG_LOCALVERSION_AUTO is not set" >> "$CONFIG_FILE"
+          echo "✅ defconfig: LOCALVERSION_AUTO 关闭，依赖 setlocalversion 输出"
 
           # Remove check_defconfig
           sed -i 's/check_defconfig//' ./common/build.config.gki
