@@ -1,4 +1,4 @@
-name: Build OnePlus_SukiSU Ultra (Az v2 - 修复 Hide SELinux + 补全 SUSFS 开关)
+name: Build OnePlus_SukiSU Ultra (Az v4 - SELinux 条件兜底 + 内核名定制)
 on:
   workflow_dispatch:
     inputs:
@@ -205,6 +205,7 @@ jobs:
         env:
           KSUVER: ${{ env.KSUVER }}
           KERNEL_SUFFIX: ${{ github.event.inputs.KERNEL_SUFFIX }}
+          ANDROID_VERSION: ${{ github.event.inputs.ANDROID_VERSION }}
         run: |
           set -euo pipefail
           cd kernel_workspace/kernel_platform
@@ -215,11 +216,16 @@ jobs:
           SUFFIX=$(echo "$SUFFIX" | sed 's/[^A-Za-z0-9_-]//g')
           [ -z "$SUFFIX" ] && SUFFIX="Az1688"
 
-          # 最终要呈现的 LOCALVERSION 字符串
-          # uname -r 输出： <KERNEL_VERSION>-<ANDROID_VERSION>-<KSUVER>-<SUFFIX>
-          # setlocalversion 应该输出："-<KSUVER>-<SUFFIX>"（前导横杠）
-          FINAL_LOCAL="-${KSUVER}-${SUFFIX}"
+          # ANDROID_VERSION 输入是 "android14" / "android15" 等，直接用
+          AV="${ANDROID_VERSION:-android14}"
+
+          # 最终 LOCALVERSION 字符串
+          # 目标 uname -r: 6.1.118-android14-{KSUVER}-{SUFFIX}
+          # base 部分 "6.1.118" 来自 Makefile VERSION/PATCHLEVEL/SUBLEVEL
+          # LOCALVERSION 提供："-android14-{KSUVER}-{SUFFIX}"（前导横杠）
+          FINAL_LOCAL="-${AV}-${KSUVER}-${SUFFIX}"
           echo "🎯 目标 setlocalversion 输出：$FINAL_LOCAL"
+          echo "🎯 完整 uname -r 预期：6.1.118${FINAL_LOCAL}"
 
           # 改 common/scripts/setlocalversion：直接 echo 固定字符串，跳过 git/svn 逻辑
           # ⚠️ 不用 heredoc（YAML 缩进下 EOF 终结符不识别），用 printf 三行写入
@@ -407,15 +413,18 @@ jobs:
           STUB_FILE="$STUB_DIR/az_link_stubs.c"
           cat > "$STUB_FILE" <<'STUB_EOF'
           // SPDX-License-Identifier: GPL-2.0
-          // AZ stubs v2: 全部 weak symbol —— 真实实现存在时被覆盖，不存在时回落
-          // 这样 "Hide SELinux Modifications" 等开关在 Manager 里会真正可用
+          // AZ stubs v4: 只保留与 SELinux 无关的 weak stub
+          //   fake_state / ksu_selinux_hide_running 不在这里提供
+          //   → 留给后续的 Az v4 conditional fallback step 根据 patch 结果决定
+          //     如果 hide_stuff.patch 没提供，那一步会注入 STRONG 符号
+          //     如果 hide_stuff.patch 提供了，那一步什么都不做
           #include <linux/jump_label.h>
           #include <linux/types.h>
           #include <linux/module.h>
           #include <linux/kernel.h>
           #include <linux/stddef.h>
 
-          // static_key_false 占位（weak 让真实定义优先）
+          // static_key_false 占位（与 SELinux 无关）
           #ifndef KSU_INPUT_HOOK_KEY_DEFINED
           DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false);
           #endif
@@ -423,17 +432,9 @@ jobs:
           DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);
           #endif
 
-          // hook 启用检查 — 用 __weak 让 SukiSU 自己的实现优先
+          // hook 启用检查 — weak 让 SukiSU 自己的实现优先（与 SELinux 无关）
           __attribute__((weak)) bool ksu_is_input_hook_enabled(void) { return false; }
           __attribute__((weak)) bool ksu_is_init_rc_hook_enabled(void) { return false; }
-
-          // SELinux 隐藏 — 关键：必须 weak，否则 Manager 报"不支持"
-          // 真实实现在 kernel/selinux/selinux.c 里，weak 让链接器选它
-          __attribute__((weak)) bool ksu_selinux_hide_running(void) { return false; }
-
-          // fake_state: 69_hide_stuff.patch 用它做 selinux 状态欺骗
-          // weak 让 patch 自己的定义优先
-          __attribute__((weak)) int fake_state = 1;
           STUB_EOF
           # 去掉 heredoc 每行前导的 10 个空格（YAML 缩进）
           /usr/bin/sed -i 's/^          //' "$STUB_FILE"
@@ -628,7 +629,143 @@ jobs:
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
           echo "正在打隐藏应用补丁"
-          patch -p1 -F 3 < 69_hide_stuff.patch
+          # -F 3 = allow 3 lines fuzz；保留 .rej 文件用于诊断
+          if patch -p1 -F 3 --no-backup-if-mismatch < 69_hide_stuff.patch; then
+              echo "✅ hide_stuff.patch 全部 apply 成功"
+          else
+              echo "::warning::hide_stuff.patch 有 hunk 失败，下面列出 .rej 文件："
+              find . -name "*.rej" | head -20 | xargs -I{} sh -c 'echo "── {} ──"; cat "{}"; echo ""' || true
+          fi
+
+          # Az v3: 显式检查 hide_stuff.patch 关键产物
+          echo ""
+          echo "── 检查 fake_state 是否被定义在 selinuxfs.c："
+          if grep -q "fake_state" security/selinux/selinuxfs.c 2>/dev/null; then
+              echo "  ✅ selinuxfs.c 含 fake_state"
+              grep -n "fake_state" security/selinux/selinuxfs.c | head -5
+          else
+              echo "  ⚠️ selinuxfs.c 不含 fake_state，hide_stuff.patch 可能改动了别的文件"
+              echo "  搜索整棵 security/ 树："
+              grep -rln "fake_state" security/ 2>/dev/null | head -5 || echo "  (完全找不到)"
+          fi
+
+          echo ""
+          echo "── 检查 ksu_selinux_hide_running 是否被定义："
+          grep -rln "ksu_selinux_hide_running\s*(" security/ ../KernelSU 2>/dev/null | head -5 || echo "  (未找到)"
+
+      # ============================================================
+      # Az v4: SELinux 深度诊断 + 条件兜底
+      # 目的：解决 Manager 里 "Hide SELinux Modifications" 灰显问题
+      # 策略：
+      #   1) 诊断 fake_state / ksu_selinux_hide_running 是否被强符号定义
+      #   2) 如果强符号已存在 → 不做任何事，让 patch 胜出
+      #   3) 如果强符号缺失 → 注入 STRONG 兜底（保证链接通过 + 避免 weak）
+      # ============================================================
+      - name: 🔬 Verify SELinux hide symbols + conditional fallback
+        run: |
+          set -uo pipefail
+          cd kernel_workspace/kernel_platform
+          echo "::group::SELinux hide 符号检查"
+
+          # 找 KSU 目录（兜底文件要放进去）
+          KSU_DIR=""
+          for d in KernelSU common/drivers/kernelsu drivers/kernelsu; do
+              if [ -d "$d" ]; then KSU_DIR="$d"; break; fi
+          done
+          [ -z "$KSU_DIR" ] && { echo "::error::no KSU dir"; exit 1; }
+          echo "📁 KSU: $KSU_DIR"
+
+          # 1) 检查 fake_state 是否被【非 static 非 weak】定义
+          echo ""
+          echo "── 检查 fake_state 强符号定义："
+          # 匹配 "int fake_state" 但排除 "static int" 和 "extern"
+          FAKE_STRONG=$(grep -rEn "^[[:space:]]*(int|unsigned[[:space:]]+int)[[:space:]]+fake_state[[:space:]]*[=;]" \
+                        common/security KernelSU 2>/dev/null | grep -v "static\|extern\|__weak" || true)
+          if [ -n "$FAKE_STRONG" ]; then
+              echo "  ✅ 强符号已存在："
+              echo "$FAKE_STRONG" | sed 's/^/    /'
+              NEED_FAKE_STATE=0
+          else
+              echo "  ⚠️ 强符号未找到 → 将注入兜底"
+              NEED_FAKE_STATE=1
+          fi
+
+          # 2) 检查 ksu_selinux_hide_running 是否被定义（非 weak）
+          echo ""
+          echo "── 检查 ksu_selinux_hide_running 强符号定义："
+          HIDE_STRONG=$(grep -rEn "^[[:space:]]*(bool|int)[[:space:]]+ksu_selinux_hide_running" \
+                        common/security KernelSU 2>/dev/null | grep -v "extern\|__weak" || true)
+          if [ -n "$HIDE_STRONG" ]; then
+              echo "  ✅ 强符号已存在："
+              echo "$HIDE_STRONG" | sed 's/^/    /'
+              NEED_HIDE_FN=0
+          else
+              echo "  ⚠️ 强符号未找到 → 将注入兜底"
+              NEED_HIDE_FN=1
+          fi
+
+          # 3) .rej 文件列表（如果 hide_stuff.patch 部分失败）
+          echo ""
+          echo "── .rej 文件列表（patch 失败的部分）："
+          REJS=$(find common KernelSU -name "*.rej" 2>/dev/null | head -10)
+          if [ -n "$REJS" ]; then
+              echo "$REJS" | sed 's/^/    /'
+          else
+              echo "    (无失败 hunk)"
+          fi
+
+          # 4) 条件注入兜底文件
+          if [ "$NEED_FAKE_STATE" = "1" ] || [ "$NEED_HIDE_FN" = "1" ]; then
+              echo ""
+              echo "── 注入强符号兜底文件："
+              FALLBACK_FILE="$KSU_DIR/kernel/az_selinux_fallback.c"
+              [ -d "$KSU_DIR/kernel" ] || FALLBACK_FILE="$KSU_DIR/az_selinux_fallback.c"
+
+              {
+                  echo "// SPDX-License-Identifier: GPL-2.0"
+                  echo "// Az v4 fallback: hide_stuff.patch 没提供强符号时的兜底"
+                  echo "// 这些是 STRONG 符号（不带 __weak），保证链接成功"
+                  echo "#include <linux/types.h>"
+                  echo "#include <linux/kernel.h>"
+                  echo ""
+                  if [ "$NEED_FAKE_STATE" = "1" ]; then
+                      echo "// SELinux 假状态：1=enforcing（默认）"
+                      echo "int fake_state = 1;"
+                      echo ""
+                  fi
+                  if [ "$NEED_HIDE_FN" = "1" ]; then
+                      echo "// SELinux 隐藏状态查询：默认未隐藏"
+                      echo "bool ksu_selinux_hide_running(void) { return false; }"
+                      echo ""
+                  fi
+              } > "$FALLBACK_FILE"
+              echo "  📄 写入 $FALLBACK_FILE"
+              cat "$FALLBACK_FILE"
+
+              # 找 Makefile 加入 obj-y
+              MAKEFILE=""
+              for f in "$KSU_DIR/Kbuild" "$KSU_DIR/Makefile" "$KSU_DIR/kernel/Kbuild" "$KSU_DIR/kernel/Makefile"; do
+                  [ -f "$f" ] && MAKEFILE="$f" && break
+              done
+              if [ -n "$MAKEFILE" ]; then
+                  OBJ_NAME="az_selinux_fallback.o"
+                  if ! grep -q "$OBJ_NAME" "$MAKEFILE"; then
+                      {
+                          echo ""
+                          echo "# Az v4: SELinux fallback (only when hide_stuff.patch 没提供)"
+                          echo "obj-\$(CONFIG_KSU) += $OBJ_NAME"
+                      } >> "$MAKEFILE"
+                      echo "  ✅ $OBJ_NAME 已加入 $MAKEFILE"
+                  fi
+              else
+                  echo "  ::warning::找不到 Makefile，兜底文件可能不被编译"
+              fi
+          else
+              echo ""
+              echo "✅ 强符号都已存在，无需兜底，patch 胜出"
+          fi
+
+          echo "::endgroup::"
 
       - name: Apply LZ4KD
         run: |
